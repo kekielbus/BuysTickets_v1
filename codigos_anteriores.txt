@@ -1,0 +1,750 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import mysql.connector
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask import Flask
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import os
+from werkzeug.utils import secure_filename
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+import mysql.connector
+import os
+from werkzeug.utils import secure_filename
+from flask import send_file
+from io import BytesIO
+
+
+app = Flask(__name__)
+CORS(app)
+
+# Configuración
+UPLOAD_FOLDER = 'uploads/discapacidad'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+
+db = mysql.connector.connect(
+    host="localhost",
+    user="root",
+    password="",
+    database="buystickets"
+)
+cursor = db.cursor(dictionary=True)
+
+import base64
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json
+    user = data.get('user')
+    password = data.get('password')
+
+    cursor.execute("SELECT * FROM users WHERE user = %s", (user,))
+    user_data = cursor.fetchone()
+
+    if user_data and check_password_hash(user_data['password'], password):
+        # Convertir imagen a base64 si existe
+        profile_base64 = None
+        if user_data['profile']:
+            profile_base64 = f"data:image/png;base64,{base64.b64encode(user_data['profile']).decode('utf-8')}"
+
+        return jsonify(success=True, 
+                    nombre=user_data['name'], 
+                    apellido=user_data['surname'], 
+                    role=user_data['role'], 
+                    profile=profile_base64,
+                    email=user_data['email'])
+
+    return jsonify(success=False, message="Usuario o contraseña incorrectos.")
+
+
+import re  # Importamos el módulo para expresiones regulares
+
+@app.route('/register', methods=['POST'])
+def register():
+    user = request.form['user']
+    password = request.form['password']
+    nombre = request.form['nombre']
+    apellido = request.form['apellido']
+    email = request.form['email']
+    role = "estandar"
+
+    forbidden_pattern = r".*admin.*|.*administrador.*|.*root.*|.*super.*"
+    if re.search(forbidden_pattern, user, re.IGNORECASE):
+        return jsonify(success=False, message="El nombre de usuario no está permitido. Por favor, elige otro.")
+
+    # Verificar si el usuario ya existe
+    cursor.execute("SELECT * FROM users WHERE user = %s", (user,))
+    if cursor.fetchone():
+        return jsonify(success=False, message="El nombre de usuario ya está en uso. Por favor, elige otro.")
+
+    # Verificar si el correo ya existe
+    cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
+    if cursor.fetchone():
+        return jsonify(success=False, message="Este correo ya está registrado. Por favor, usa otro.")
+
+    profile = request.files['profile'].read() if 'profile' in request.files else None
+    hashed_password = generate_password_hash(password, method='pbkdf2:sha256')
+
+    try:
+        cursor.execute("""
+            INSERT INTO users (user, password, name, surname, email, role, profile)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (user, hashed_password, nombre, apellido, email, role, profile))
+        db.commit()
+        return jsonify(success=True)
+    except mysql.connector.Error as err:
+        return jsonify(success=False, message="Error al registrar el usuario: " + str(err))
+
+UPLOAD_FOLDER = 'uploads/'  # Define donde se guardarán las imágenes
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+# Verifica si la extensión del archivo es válida
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+# Actualización de los datos del usuario, incluyendo la imagen de perfil como binario
+@app.route('/update-user', methods=['POST'])
+def update_user():
+    data = request.form
+    user = data.get('user')
+    nombre = data.get('nombre')
+    apellido = data.get('apellido')
+    email = data.get('email')
+    new_password = data.get('newPassword')
+
+    # Obtener el archivo de perfil si existe
+    profile = request.files.get('profile')
+
+    if not user:
+        return jsonify(success=False, message="Falta el nombre de usuario.")
+
+    # Si se proporciona una nueva contraseña, generamos el hash
+    hashed_password = generate_password_hash(new_password, method='pbkdf2:sha256') if new_password else None
+
+    # Intentamos actualizar los datos
+    try:
+        if nombre and apellido:
+            cursor.execute("UPDATE users SET name=%s, surname=%s WHERE user=%s", (nombre, apellido, user))
+        if email:
+            cursor.execute("UPDATE users SET email=%s WHERE user=%s", (email, user))
+        if hashed_password:
+            cursor.execute("UPDATE users SET password=%s WHERE user=%s", (hashed_password, user))
+
+        # Si hay una nueva imagen de perfil, la guardamos como BLOB en la base de datos
+        if profile:
+            profile_data = profile.read()  # Lee el contenido del archivo como binario
+            cursor.execute("UPDATE users SET profile=%s WHERE user=%s", (profile_data, user))  # Almacena la imagen como BLOB
+
+        db.commit()
+        return jsonify(success=True, message="Datos actualizados correctamente.")
+    except mysql.connector.Error as err:
+        return jsonify(success=False, message=str(err))
+
+    
+def enviar_correo_eliminacion(destinatario, nombre_usuario):
+    remitente = "buystickets.customer@gmail.com"
+    contraseña = "ikch pecb cuzu dkdn"  # Contraseña de aplicación de Gmail
+
+    mensaje = MIMEMultipart("alternative")
+    mensaje["Subject"] = "Cuenta eliminada"
+    mensaje["From"] = remitente
+    mensaje["To"] = destinatario
+
+    texto = f"""
+Hola {nombre_usuario},
+
+Tu cuenta ha sido eliminada correctamente de BuyTickets.
+
+Si no realizaste esta acción o tienes dudas, por favor contáctanos.
+
+Atentamente,
+El equipo de BuyTickets
+"""
+    mensaje.attach(MIMEText(texto, "plain"))
+
+    try:
+        servidor = smtplib.SMTP("smtp.gmail.com", 587)
+        servidor.ehlo()
+        servidor.starttls()
+        servidor.login(remitente, contraseña)
+        servidor.sendmail(remitente, destinatario, mensaje.as_string())
+        servidor.quit()
+        print(f"✅ Correo enviado a {destinatario}")
+    except Exception as e:
+        print(f"❌ Error al enviar correo: {e}")
+
+@app.route('/delete-user', methods=['DELETE'])
+def delete_user():
+    data = request.get_json()
+    user = data.get('user')
+    password = data.get('password')
+
+    print("📥 Solicitud para eliminar usuario:", user)
+
+    if not user or not password:
+        return jsonify(success=False, message="Faltan datos necesarios.")
+
+    try:
+        cursor.execute("SELECT * FROM users WHERE user = %s", (user,))
+        user_data = cursor.fetchone()
+
+        if not user_data:
+            print("❌ Usuario no encontrado en la base de datos")
+            return jsonify(success=False, message="Usuario no encontrado.")
+
+        if not check_password_hash(user_data['password'], password):
+            print("❌ Contraseña incorrecta")
+            return jsonify(success=False, message="Contraseña incorrecta.")
+
+        cursor.execute("DELETE FROM users WHERE user = %s", (user,))
+        db.commit()
+
+        if cursor.rowcount == 0:
+            print("❌ No se eliminó ninguna fila (¿ya estaba borrado?)")
+            return jsonify(success=False, message="No se pudo eliminar el usuario.")
+
+        print("✅ Usuario eliminado correctamente")
+
+        # Enviar correo si hay un email registrado
+        if user_data.get("email"):
+            enviar_correo_eliminacion(user_data["email"], user_data["user"])
+
+        return jsonify(success=True, message="Cuenta eliminada permanentemente.")
+
+    except mysql.connector.Error as err:
+        print("❌ Error en MySQL:", err)
+        return jsonify(success=False, message="Error de base de datos.")
+
+@app.route('/verify-user', methods=['POST'])
+def verify_user():
+    data = request.get_json()
+    user = data.get('user')
+
+    if not user:
+        return jsonify(exists=False, message="Falta el nombre de usuario.")
+
+    cursor.execute("SELECT * FROM users WHERE user = %s", (user,))
+    user_data = cursor.fetchone()
+
+    if user_data:
+        return jsonify(exists=True)
+    else:
+        return jsonify(exists=False)
+
+from datetime import datetime, timedelta
+
+@app.route('/update-role-to-premium', methods=['POST'])
+def update_role_to_premium():
+    data = request.get_json()
+    user_id = data.get('user_id')
+    payment_status = data.get('payment_status')  # El estado del pago, 'COMPLETED' en caso de éxito
+
+    if not user_id or not payment_status:
+        return jsonify(success=False, message="Faltan datos necesarios.")
+
+    # Verificar si el pago fue exitoso
+    if payment_status != "COMPLETED":
+        return jsonify(success=False, message="El pago no fue exitoso.")
+
+    try:
+        # Calcular la fecha de expiración (3 meses a partir de ahora)
+        expiry_date = datetime.now() + timedelta(weeks=13)  # 3 meses
+
+        # Cambiar el rol a 'premium' en la base de datos y actualizar la fecha de expiración
+        cursor.execute("""
+            UPDATE users
+            SET role = %s, subscription_expiry_date = %s
+            WHERE id = %s
+        """, ("premium", expiry_date, user_id))
+        db.commit()
+
+        # Verificar si el cambio fue exitoso
+        if cursor.rowcount > 0:
+            return jsonify(success=True, message="Rol actualizado a Premium.", expiry_date=expiry_date.strftime("%Y-%m-%d"))
+        else:
+            return jsonify(success=False, message="No se pudo actualizar el rol.")
+
+    except mysql.connector.Error as err:
+        return jsonify(success=False, message="Error al actualizar el rol: " + str(err))
+
+import random
+
+# Mapeo temporal de usuarios a códigos (puedes usar una tabla en BD si prefieres)
+reset_codes = {}
+
+def enviar_codigo_correo(destinatario, nombre_usuario, codigo):
+    remitente = "buystickets.customer@gmail.com"
+    contraseña = "ikch pecb cuzu dkdn"  # Contraseña de aplicación de Gmail
+
+    mensaje = MIMEMultipart("alternative")
+    mensaje["Subject"] = "Código de recuperación de contraseña"
+    mensaje["From"] = remitente
+    mensaje["To"] = destinatario
+
+    texto = f"""
+Hola {nombre_usuario},
+
+Has solicitado recuperar tu contraseña. Este es tu código de verificación:
+
+🔐 Código: {codigo}
+
+Si no solicitaste este cambio, ignora este mensaje.
+
+El equipo de BuyTickets
+"""
+    mensaje.attach(MIMEText(texto, "plain"))
+
+    try:
+        servidor = smtplib.SMTP("smtp.gmail.com", 587)
+        servidor.ehlo()
+        servidor.starttls()
+        servidor.login(remitente, contraseña)
+        servidor.sendmail(remitente, destinatario, mensaje.as_string())
+        servidor.quit()
+        print(f"✅ Código de recuperación enviado a {destinatario}")
+    except Exception as e:
+        print(f"❌ Error al enviar el código: {e}")
+
+@app.route('/send-recovery-code', methods=['POST'])
+def send_recovery_code():
+    data = request.get_json()
+    user = data.get("user")
+
+    cursor.execute("SELECT * FROM users WHERE user=%s", (user,))
+    user_data = cursor.fetchone()
+
+    if not user_data:
+        return jsonify(success=False, message="Usuario no encontrado.")
+
+    codigo = str(random.randint(10000000, 99999999))  # Código de 8 dígitos
+    reset_codes[user] = codigo
+
+    enviar_codigo_correo(user_data["email"], user, codigo)
+    return jsonify(success=True, message="Código enviado.")
+
+@app.route('/verify-recovery-code', methods=['POST'])
+def verify_recovery_code():
+    data = request.get_json()
+    user = data.get("user")
+    code = data.get("code")
+
+    if reset_codes.get(user) == code:
+        return jsonify(success=True)
+    return jsonify(success=False, message="Código incorrecto o expirado.")
+
+
+@app.route('/change-password', methods=['POST'])
+def change_password():
+    data = request.get_json()
+    user = data.get("user")
+    new_password = data.get("new_password")
+
+    hashed = generate_password_hash(new_password)
+
+    try:
+        cursor.execute("UPDATE users SET password=%s WHERE user=%s", (hashed, user))
+        db.commit()
+
+        # Notificar al usuario por email (opcional)
+        cursor.execute("SELECT email FROM users WHERE user=%s", (user,))
+        email_result = cursor.fetchone()
+        if email_result:
+            enviar_notificacion_cambio(email_result["email"], user)
+
+        # Eliminar código usado
+        if user in reset_codes:
+            del reset_codes[user]
+
+        return jsonify(success=True, message="Contraseña actualizada.")
+    except:
+        return jsonify(success=False, message="Error al cambiar la contraseña.")
+
+def enviar_notificacion_cambio(destinatario, nombre_usuario):
+    remitente = "buystickets.customer@gmail.com"
+    contraseña = "ikch pecb cuzu dkdn"
+
+    mensaje = MIMEMultipart("alternative")
+    mensaje["Subject"] = "Contraseña cambiada"
+    mensaje["From"] = remitente
+    mensaje["To"] = destinatario
+
+    texto = f"""
+Hola {nombre_usuario},
+
+Tu contraseña ha sido cambiada correctamente.
+
+Si no realizaste este cambio, contacta con nosotros inmediatamente.
+
+El equipo de BuyTickets
+"""
+    mensaje.attach(MIMEText(texto, "plain"))
+
+    try:
+        servidor = smtplib.SMTP("smtp.gmail.com", 587)
+        servidor.ehlo()
+        servidor.starttls()
+        servidor.login(remitente, contraseña)
+        servidor.sendmail(remitente, destinatario, mensaje.as_string())
+        servidor.quit()
+        print(f"✅ Correo de confirmación enviado a {destinatario}")
+    except Exception as e:
+        print(f"❌ Error al enviar correo de confirmación: {e}")
+
+@app.route('/solicitar-discapacidad', methods=['POST'])
+def solicitar_discapacidad():
+    nombre = request.form.get("nombre")
+    apellido = request.form.get("apellido")
+    dni = request.form.get("dni")
+    grado_discapacidad = request.form.get("grado_discapacidad")
+    usuario = request.form.get("usuario")
+    archivo = request.files.get("archivo")
+
+    if not all([nombre, apellido, dni, grado_discapacidad, usuario]):
+        return jsonify(success=False, message="Faltan datos obligatorios.")
+
+    # Verificamos si el archivo existe
+    archivo_bytes = None
+    archivo_nombre = None
+    if archivo:
+        archivo_nombre = secure_filename(archivo.filename)
+        archivo_bytes = archivo.read()  # Se guarda como BLOB
+
+    try:
+        # Verificar si ya existe una solicitud con ese DNI o usuario
+        cursor.execute("SELECT id FROM solicitudes_discapacidad WHERE dni = %s OR usuario = %s", (dni, usuario))
+        if cursor.fetchone():
+            return jsonify(success=False, message="Ya existe una solicitud para este usuario o DNI.")
+
+        # Insertar solicitud con archivo como BLOB
+        cursor.execute("""
+            INSERT INTO solicitudes_discapacidad 
+            (nombre, apellido, dni, grado_discapacidad, archivo, archivo_nombre, estado, fecha_solicitud, usuario)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+        """, (nombre, apellido, dni, grado_discapacidad, archivo_bytes, archivo_nombre, "pendiente", usuario))
+
+        # Marcar al usuario como cuenta con discapacidad
+        cursor.execute("UPDATE users SET discapacidad = %s WHERE user = %s", ("sí", usuario))
+
+        db.commit()
+        return jsonify(success=True)
+    except mysql.connector.Error as err:
+        return jsonify(success=False, message="Error en la solicitud: " + str(err))
+
+@app.route('/solicitudes-discapacidad', methods=['GET'])
+def listar_solicitudes_discapacidad():
+    try:
+        cursor.execute("""
+            SELECT id, nombre, apellido, dni, grado_discapacidad, archivo_nombre, estado
+            FROM solicitudes_discapacidad
+        """)
+        solicitudes = cursor.fetchall()
+
+        if not solicitudes:
+            return jsonify(success=False, message="No hay solicitudes de discapacidad disponibles.")
+
+        # Opcional: formatear si hay campos como fecha
+        return jsonify(success=True, solicitudes=solicitudes), 200
+
+    except mysql.connector.Error as err:
+        return jsonify(success=False, message=f"Error al obtener solicitudes: {str(err)}"), 500
+
+@app.route('/archivo-solicitud/<int:solicitud_id>', methods=['GET'])
+def descargar_archivo_blob(solicitud_id):
+    try:
+        cursor.execute("SELECT archivo, archivo_nombre FROM solicitudes_discapacidad WHERE id = %s", (solicitud_id,))
+        result = cursor.fetchone()
+        if not result:
+            return "Archivo no encontrado", 404
+
+        archivo_bytes = result['archivo']
+        archivo_nombre = result.get('archivo_nombre', f"archivo_{solicitud_id}.pdf")  # nombre por defecto
+
+        return send_from_directory(
+            directory='.',
+            path='',  # No se usa porque usamos `BytesIO`
+            as_attachment=True,
+            download_name=archivo_nombre,
+            mimetype='application/octet-stream',
+            data=archivo_bytes
+        )
+    except Exception as e:
+        print(f"❌ Error al servir el archivo: {e}")
+        return "Error al descargar archivo", 500
+
+# Definición de la función que envía el correo
+def enviar_correo_estado(destinatario, nombre_usuario, estado):
+    remitente = "buystickets.customer@gmail.com"
+    contraseña = "ikch pecb cuzu dkdn"  # Contraseña de aplicación de Gmail
+
+    asunto = "Resultado de solicitud de cuenta con discapacidad"
+    if estado == "aprobada":
+        cuerpo = f"""Hola {nombre_usuario},
+
+        Tu solicitud de cuenta con discapacidad ha sido APROBADA.
+        Ya puedes acceder a los beneficios asociados a este tipo de cuenta.
+
+        Gracias por confiar en BuyTickets.
+
+        El equipo de BuyTickets
+        """
+    else:  # En caso de que sea "rechazada"
+        cuerpo = f"""Hola {nombre_usuario},
+
+        Lamentamos informarte que tu solicitud de cuenta con discapacidad ha sido RECHAZADA.
+
+        Si tienes dudas o deseas más información, no dudes en contactarnos.
+
+        El equipo de BuyTickets
+        """
+
+    mensaje = MIMEMultipart("alternative")
+    mensaje["Subject"] = asunto
+    mensaje["From"] = remitente
+    mensaje["To"] = destinatario
+    mensaje.attach(MIMEText(cuerpo, "plain"))
+
+    try:
+        servidor = smtplib.SMTP("smtp.gmail.com", 587)
+        servidor.starttls()
+        servidor.login(remitente, contraseña)
+        servidor.sendmail(remitente, destinatario, mensaje.as_string())
+        servidor.quit()
+        print(f"✅ Correo de notificación enviado a {destinatario}")
+    except Exception as e:
+        print(f"❌ Error al enviar correo de estado: {e}")
+
+# Ruta para actualizar el estado de la solicitud
+@app.route('/actualizar-estado-solicitud', methods=['POST'])
+def actualizar_estado_solicitud():
+    data = request.get_json()
+    solicitud_id = data.get("id")
+    nuevo_estado = data.get("estado")
+
+    if not solicitud_id or not nuevo_estado:
+        return jsonify(success=False, message="Datos incompletos")
+
+    try:
+        # Obtener usuario vinculado a la solicitud
+        cursor.execute("SELECT usuario FROM solicitudes_discapacidad WHERE id = %s", (solicitud_id,))
+        result = cursor.fetchone()
+        if not result:
+            return jsonify(success=False, message="Solicitud no encontrada")
+        
+        usuario = result["usuario"]
+
+        # Actualizar el estado de la solicitud
+        cursor.execute("UPDATE solicitudes_discapacidad SET estado = %s WHERE id = %s", (nuevo_estado, solicitud_id))
+        db.commit()
+
+        # Verificar si la actualización fue exitosa
+        if cursor.rowcount > 0:
+            # Enviar correo de notificación al usuario
+            cursor.execute("SELECT email FROM users WHERE user = %s", (usuario,))
+            user_info = cursor.fetchone()
+            email = user_info["email"] if user_info else None
+
+            if email:
+                # Aquí es donde se invoca la función correctamente
+                enviar_correo_estado(email, usuario, nuevo_estado)
+
+            return jsonify(success=True, message="Estado de la solicitud actualizado")
+        else:
+            return jsonify(success=False, message="No se pudo actualizar el estado de la solicitud.")
+
+    except mysql.connector.Error as err:
+        return jsonify(success=False, message="Error al actualizar el estado: " + str(err))
+        
+@app.route('/estado-solicitud/<dni>', methods=['GET'])
+def obtener_estado_solicitud(dni):
+    try:
+        cursor.execute("SELECT estado FROM solicitudes_discapacidad WHERE dni = %s", (dni,))
+        result = cursor.fetchone()
+        if result:
+            return jsonify(success=True, estado=result["estado"])
+        else:
+            return jsonify(success=False, message="No se encontró la solicitud.")
+    except mysql.connector.Error as err:
+        return jsonify(success=False, message="Error al consultar el estado: " + str(err))
+
+@app.route('/descargar-archivo/<int:solicitud_id>', methods=['GET'])
+def descargar_archivo_por_id(solicitud_id):
+    try:
+        cursor.execute("SELECT archivo, archivo_nombre FROM solicitudes_discapacidad WHERE id = %s", (solicitud_id,))
+        result = cursor.fetchone()
+
+        if not result or not result["archivo"]:
+            return jsonify(success=False, message="Archivo no encontrado."), 404
+
+        archivo_blob = result["archivo"]
+        nombre_archivo = result.get("archivo_nombre", f"archivo_{solicitud_id}.pdf")
+
+        return send_file(
+            BytesIO(archivo_blob),
+            download_name=nombre_archivo,
+            as_attachment=True
+        )
+    except mysql.connector.Error as err:
+        return jsonify(success=False, message=f"Error al obtener archivo: {str(err)}"), 500
+
+@app.route('/estado-discapacidad/<usuario>', methods=['GET'])
+def obtener_estado_discapacidad_usuario(usuario):
+    try:
+        cursor.execute("SELECT discapacidad FROM users WHERE user = %s", (usuario,))
+        result = cursor.fetchone()
+        if result:
+            estado = result["discapacidad"]
+            if estado == "sí":
+                return jsonify(success=True, estado="aprobada")
+            elif estado == "no":
+                return jsonify(success=True, estado="rechazada")
+            else:
+                return jsonify(success=True, estado="pendiente")
+        else:
+            return jsonify(success=False, message="Usuario no encontrado.")
+    except mysql.connector.Error as err:
+        return jsonify(success=False, message="Error de base de datos: " + str(err))
+
+@app.route('/reportar-error', methods=['POST'])
+def reportar_error():
+    data = request.get_json()
+    
+    usuario = data.get('user')
+    reporte = data.get('reporte')
+    
+    if not usuario or not reporte:
+        return jsonify({"success": False, "message": "Faltan datos."}), 400
+    
+    # Crear el nuevo reporte
+    try:
+        cursor.execute("""
+            INSERT INTO reportes (usuario, reporte, estado)
+            VALUES (%s, %s, 'pendiente')
+        """, (usuario, reporte))
+        db.commit()
+        return jsonify({"success": True, "message": "Reporte enviado correctamente."}), 200
+    except mysql.connector.Error as err:
+        db.rollback()
+        return jsonify({"success": False, "message": f"Error al guardar el reporte: {str(err)}"}), 500
+
+@app.route('/reportes', methods=['GET'])
+def obtener_reportes():
+    estado = request.args.get('estado')  # Puede ser 'pendiente', 'arreglada' o 'resuelta'
+
+    try:
+        if estado:
+            cursor.execute("SELECT * FROM reportes WHERE estado = %s", (estado,))
+        else:
+            cursor.execute("SELECT * FROM reportes")
+
+        reportes = cursor.fetchall()
+
+        if not reportes:
+            return jsonify(success=False, message="No hay reportes disponibles.")
+
+        reportes_data = [
+            {
+                "id": r["id"],
+                "usuario": r["usuario"],
+                "reporte": r["reporte"],
+                "estado": r["estado"],
+                "fecha_creacion": r["fecha_creacion"].strftime('%Y-%m-%d %H:%M:%S') if r["fecha_creacion"] else None
+            } for r in reportes
+        ]
+
+        return jsonify(success=True, reportes=reportes_data), 200
+
+    except mysql.connector.Error as err:
+        return jsonify(success=False, message=f"Error al obtener los reportes: {str(err)}"), 500
+@app.route('/actualizar-reporte', methods=['POST'])
+def actualizar_reporte():
+    data = request.get_json()
+    
+    reporte_id = data.get('id')
+    nuevo_estado = data.get('estado')
+    
+    if not reporte_id or not nuevo_estado:
+        return jsonify({"success": False, "message": "Faltan datos."}), 400
+    
+    # Validar el estado
+    if nuevo_estado not in ['pendiente', 'arreglada', 'resuelta', 'eliminado']:
+        return jsonify({"success": False, "message": "Estado inválido."}), 400
+    
+    try:
+        # Si el estado es "eliminado", eliminamos el reporte
+        if nuevo_estado == 'eliminado':
+            cursor.execute("DELETE FROM reportes WHERE id = %s", (reporte_id,))
+            db.commit()
+            return jsonify({"success": True, "message": "Reporte eliminado."}), 200
+        
+        # Si no es eliminado, actualizamos el estado
+        cursor.execute("UPDATE reportes SET estado = %s WHERE id = %s", (nuevo_estado, reporte_id))
+        db.commit()
+
+        if cursor.rowcount == 0:
+            return jsonify({"success": False, "message": "Reporte no encontrado."}), 404
+        
+        return jsonify({"success": True, "message": "Estado del reporte actualizado."}), 200
+    except mysql.connector.Error as err:
+        db.rollback()
+        return jsonify({"success": False, "message": f"Error al actualizar el reporte: {str(err)}"}), 500
+
+
+@app.route('/enviar-correo-estado', methods=['POST'])
+def enviar_correo_estado():
+    data = request.get_json()
+    usuario = data.get('usuario')
+    estado = data.get('estado')
+    mensaje = data.get('mensaje')
+
+    if not usuario or not estado:
+        return jsonify(success=False, message="Faltan datos."), 400
+
+    # Buscar el correo del usuario
+    cursor.execute("SELECT email FROM users WHERE user = %s", (usuario,))
+    user_data = cursor.fetchone()
+
+    if not user_data:
+        return jsonify(success=False, message="Usuario no encontrado."), 404
+
+    email = user_data["email"]
+
+    # Crear el asunto y cuerpo del correo
+    if estado == "arreglada":
+        asunto = "Reporte arreglado"
+        cuerpo = f"Tu reporte ha sido arreglado.\n\nMensaje del administrador:\n{mensaje}"
+    elif estado == "resuelta":
+        asunto = "Reporte resuelto"
+        cuerpo = f"Tu reporte ha sido marcado como resuelto.\n\nMensaje del administrador:\n{mensaje}"
+    else:
+        return jsonify(success=False, message="Estado inválido."), 400
+
+    # Configuración del correo
+    remitente = "buystickets.customer@gmail.com"
+    contraseña = "ikch pecb cuzu dkdn"  # Contraseña de aplicación de Gmail
+
+    mensaje_correo = MIMEMultipart("alternative")
+    mensaje_correo["Subject"] = asunto
+    mensaje_correo["From"] = remitente
+    mensaje_correo["To"] = email
+    mensaje_correo.attach(MIMEText(cuerpo, "plain"))
+
+    try:
+        servidor = smtplib.SMTP("smtp.gmail.com", 587)
+        servidor.starttls()
+        servidor.login(remitente, contraseña)
+        servidor.sendmail(remitente, email, mensaje_correo.as_string())
+        servidor.quit()
+        return jsonify(success=True, message="Correo enviado correctamente.")
+    except Exception as e:
+        return jsonify(success=False, message=f"Error al enviar el correo: {str(e)}"), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
